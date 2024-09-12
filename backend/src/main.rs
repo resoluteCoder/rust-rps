@@ -11,8 +11,9 @@ use axum::{
     Router,
 };
 use futures::{SinkExt, StreamExt};
-use state::AppState;
+use state::{AppState, Player, RoomType};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() {
@@ -35,13 +36,79 @@ async fn websocket_handler(
 }
 
 async fn websocket(stream: WebSocket, app_state: Arc<AppState>) {
+    let mut match_type = String::new();
     let (mut sink, mut stream) = stream.split();
-    let (sender, mut reciever) = mpsc::channel::<String>(16);
+    let (sender, mut reciever) = mpsc::channel::<String>(100);
 
-    let player_id = app_state.gen_player_id();
-    app_state.register_player(player_id);
+    // gets match type from client
+    loop {
+        let message = match stream.next().await {
+            Some(message) => message,
+            None => break,
+        };
 
-    let mut rx = app_state.tx.subscribe();
+        let message = match message {
+            Ok(message) => message,
+            Err(_) => todo!(),
+        };
+
+        if let Message::Text(message) = message {
+            match_type = message;
+            if match_type == "quick" || match_type == "private" {
+                let _ = sink
+                    .send(Message::Text(format!(
+                        "Connected successfully. Finding opponent..."
+                    )))
+                    .await;
+                break;
+            }
+        }
+    }
+    // prob should use a logger
+    println!("requested match type: {match_type}");
+
+    /*
+    if quick play
+        are there any rooms
+            if no - create room - player goes in there - exit
+            if yes
+                search for empty slots in rooms
+                    if no - create room - player goes in there - exit
+                    if yes
+                        player goes in there - proceed to start match
+    if private match
+        create - create room - player goes in there - exit
+        join - find room with uuid - player goes in there - proceed to start match
+
+    */
+    let player = Player::new();
+    let player_id = player.id;
+    let room_id: Uuid;
+
+    // if match_type == "quick" {
+    if let Some(id) = app_state.available_rooms() {
+        room_id = id;
+        app_state.add_player_to_existing_room(id, player);
+    } else {
+        room_id = app_state.add_player_to_new_room(RoomType::Public, player);
+    }
+    println!("{room_id}");
+    // }
+
+    // if match_type == "private" {}
+
+    /* everything below needs an update */
+
+    // let mut rx = app_state.tx.subscribe();
+    let room_tx = match app_state.get_room_sender(room_id) {
+        Ok(rx) => rx,
+        Err(e) => {
+            println!("{e}");
+            panic!()
+        }
+    };
+
+    let mut room_rx = room_tx.subscribe();
 
     // when connected immediately send you are connected as player id #
     let _ = sink
@@ -69,7 +136,7 @@ async fn websocket(stream: WebSocket, app_state: Arc<AppState>) {
     // let tx = app_state.tx.clone();
     let mut broadcast = tokio::spawn(async move {
         loop {
-            let message = match rx.recv().await {
+            let message = match room_rx.recv().await {
                 Ok(message) => message,
                 Err(_) => todo!(),
             };
@@ -83,7 +150,7 @@ async fn websocket(stream: WebSocket, app_state: Arc<AppState>) {
             let message = match stream.next().await {
                 Some(message) => message,
                 None => {
-                    app_state.remove_player(player_id);
+                    // app_state.remove_player(player_id);
                     break;
                 }
             };
@@ -100,21 +167,23 @@ async fn websocket(stream: WebSocket, app_state: Arc<AppState>) {
 
             let valid_choices = vec!["rock", "paper", "scissors"];
             let is_valid = valid_choices.contains(&message.as_str());
-            let has_chosen = !app_state.has_player_chosen(player_id);
+            let has_chosen = !app_state.has_player_chosen(room_id, player_id);
             if is_valid && !has_chosen {
-                app_state.set_player_choice(player_id, message);
+                app_state.set_player_choice(room_id, player_id, message);
 
                 // send to broadcast
-                let _ = app_state
-                    .tx
-                    .send(format!("player: {player_id} has made their choice"));
+                // let _ = app_state
+                //     .tx
+                //     .send(format!("player: {player_id} has made their choice"));
+                let _ = room_tx.send(format!("player: {player_id} has made their choice"));
             }
 
-            println!("{}", app_state.players_finished());
-            if app_state.players_finished() {
-                match app_state.calculate_winner() {
+            println!("{}", app_state.players_finished(room_id));
+            if app_state.players_finished(room_id) {
+                match app_state.calculate_winner(room_id) {
                     Some(winner) => {
-                        let _ = app_state.tx.send(format!(
+                        // should be room tx not app state
+                        let _ = room_tx.send(format!(
                             "player: {} is the winner using {}!",
                             winner.id, winner.choice
                         ));
